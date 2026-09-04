@@ -70,7 +70,7 @@ static int emulate_tiocmset(unsigned long request, void *argument)
 
     int mask = *(int *)argument;
     uint32_t bits = shared->bits;
-    uint32_t modem_bits = bits & (uint32_t)(TIOCM_DSR | TIOCM_CAR);
+    uint32_t modem_bits = bits & (uint32_t)(TIOCM_DSR | TIOCM_CAR | TIOCM_RNG);
 
     if (request == TIOCMSET) {
         bits = modem_bits | (uint32_t)(mask & (TIOCM_DTR | TIOCM_RTS));
