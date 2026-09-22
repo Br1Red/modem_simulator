@@ -65,9 +65,17 @@ bin/modemsimulator-pty-handler --tty-file /tmp/modem-sim.tty --control-file /tmp
 
 The older form after `--` is still accepted and uses the same child command for both outgoing and incoming calls.
 
+Use `--dsr-always-on` before `--` to start the bridge with DSR permanently asserted:
+
+```sh
+bin/modemsimulator-pty-handler --control-file /tmp/modem-sim.ctrl -- \
+	bin/modemsimulator-hayes-bridge --dsr-always-on
+```
+
 Accepted commands in command mode:
 
 - `AT`: returns `OK`.
+- Multiple commands can be concatenated in one instruction, for example `AT&C1&D2`.
 - `ATZ`: resets modem settings and returns `OK`.
 - `ATE0`: disables command echo and returns `OK`.
 - `ATE1`: enables command echo and returns `OK`.
@@ -82,6 +90,10 @@ Accepted commands in command mode:
 - `AT&D1`: switches from data mode to command mode when DTR drops, without killing the child.
 - `AT&D2`: hangs up when DTR drops. This is the default.
 - `AT&D3`: hangs up and resets modem settings when DTR drops.
+- `AT&C0` and `AT&C1`: accepts the carrier-detect reporting setting.
+- `ATQ0` and `ATQ1`: enables or suppresses result codes.
+- `ATV0` and `ATV1`: selects numeric or verbose result codes. Verbose mode is the default.
+- `AT&S0` and `AT&S1`: keeps DSR always on or follows the DTR policy, respectively.
 
 While in data mode, serial input is forwarded to the child process. The escape sequence `+++` switches back to command mode without killing the child. If the child exits by itself, CD is dropped and the modem returns `NO CARRIER`.
 

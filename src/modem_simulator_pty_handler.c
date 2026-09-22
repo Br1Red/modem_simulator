@@ -140,8 +140,13 @@ static int modem_control_bits(const struct modem_control *control)
 static void modem_control_apply(struct modem_control *control)
 {
     int bits = modem_control_bits(control);
+    bool dsr = control->dsr;
 
-    if (control->dsr) {
+    if (control->shared != NULL && (control->shared->flags & MODEM_CONTROL_DSR_ALWAYS) != 0) {
+        dsr = true;
+    }
+
+    if (dsr) {
         bits |= TIOCM_DSR;
     } else {
         bits &= ~TIOCM_DSR;
@@ -188,6 +193,7 @@ static struct modem_control_shared *open_control_file(const char *path)
     shared->version = MODEM_CONTROL_VERSION;
     shared->bits = TIOCM_DTR | TIOCM_DSR;
     shared->generation = 1;
+    shared->flags = 0;
     return shared;
 }
 

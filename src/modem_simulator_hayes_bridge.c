@@ -50,6 +50,9 @@ struct child_process {
 
 struct modem_state {
     bool echo;
+    bool quiet;
+    bool verbose;
+    bool dsr_always;
     enum modem_mode mode;
     enum dtr_policy dtr_policy;
     char **dial_command;
@@ -71,6 +74,30 @@ struct modem_state {
 static void modem_write(const char *text)
 {
     modem_write_all(STDOUT_FILENO, text, strlen(text));
+}
+
+static void modem_result(struct modem_state *state, int numeric, const char *verbose)
+{
+    if (state->quiet) {
+        return;
+    }
+    if (state->verbose) {
+        modem_write(verbose);
+    } else {
+        char response[16];
+        snprintf(response, sizeof(response), "%d\r\n", numeric);
+        modem_write(response);
+    }
+}
+
+static void result_ok(struct modem_state *state)
+{
+    modem_result(state, 0, "OK\r\n");
+}
+
+static void result_error(struct modem_state *state)
+{
+    modem_result(state, 4, "ERROR\r\n");
 }
 
 static long long now_ms(void)
@@ -118,6 +145,9 @@ static void set_carrier(struct modem_state *state, bool enabled)
     } else {
         bits &= ~TIOCM_CAR;
     }
+    if (state->dsr_always) {
+        bits |= TIOCM_DSR;
+    }
 
     if (bits != state->control->bits) {
         state->control->bits = bits;
@@ -148,6 +178,9 @@ static void set_ring_indicator(struct modem_state *state, bool enabled)
 static void reset_settings(struct modem_state *state)
 {
     state->echo = true;
+    state->quiet = false;
+    state->verbose = true;
+    state->dsr_always = false;
     state->dtr_policy = DTR_HANGUP;
     state->s0_auto_answer_rings = 0;
 }
@@ -252,7 +285,7 @@ static void report_no_carrier(struct modem_state *state)
     state->incoming_call = false;
     state->mode = MODE_COMMAND;
     state->plus_count = 0;
-    modem_write("NO CARRIER\r\n");
+    modem_result(state, 3, "NO CARRIER\r\n");
 }
 
 static void reject_incoming_call(struct modem_state *state)
@@ -273,7 +306,7 @@ static void enter_data_mode(struct modem_state *state)
     set_carrier(state, true);
     state->mode = MODE_DATA;
     state->plus_count = 0;
-    modem_write("CONNECT 9600\r\n");
+    modem_result(state, 1, "CONNECT 9600\r\n");
 }
 
 static void start_incoming_call(struct modem_state *state)
@@ -320,7 +353,7 @@ static void handle_ringing(struct modem_state *state)
     set_ring_indicator(state, true);
     state->ring_indicator_until_ms = current_ms + 2000;
     state->next_ring_ms = current_ms + 3000;
-    modem_write("RING\r\n");
+    modem_result(state, 2, "RING\r\n");
 
     if (state->s0_auto_answer_rings > 0 && state->ring_count >= (unsigned int)state->s0_auto_answer_rings) {
         answer_call(state);
@@ -336,76 +369,143 @@ static void handle_command(struct modem_state *state)
 
     upper_ascii(state->line);
 
-    if (strcmp(state->line, "AT") == 0) {
-        modem_write("OK\r\n");
-    } else if (strcmp(state->line, "ATZ") == 0) {
-        reset_settings(state);
-        modem_write("OK\r\n");
-    } else if (strcmp(state->line, "ATE0") == 0) {
-        state->echo = false;
-        modem_write("OK\r\n");
-    } else if (strcmp(state->line, "ATE1") == 0) {
-        state->echo = true;
-        modem_write("OK\r\n");
-    } else if (strcmp(state->line, "ATI") == 0) {
-        modem_write("stdio modem simulator\r\nOK\r\n");
-    } else if (strncmp(state->line, "ATD", 3) == 0) {
-        if (!state->child.running && !spawn_child(&state->child, state->dial_command)) {
-            report_no_carrier(state);
+    if (strncmp(state->line, "AT", 2) != 0) {
+        result_error(state);
+        return;
+    }
+
+    char *command = state->line + 2;
+    if (*command == '\0') {
+        result_ok(state);
+        return;
+    }
+
+    bool command_error = false;
+    bool show_identification = false;
+    bool show_s0 = false;
+    bool terminal_response = false;
+    while (*command != '\0') {
+        if (strcmp(command, "Z") == 0) {
+            reset_settings(state);
+            break;
+        } else if (strncmp(command, "E0", 2) == 0) {
+            state->echo = false;
+            command += 2;
+        } else if (strncmp(command, "E1", 2) == 0) {
+            state->echo = true;
+            command += 2;
+        } else if (strncmp(command, "Q0", 2) == 0) {
+            state->quiet = false;
+            command += 2;
+        } else if (strncmp(command, "Q1", 2) == 0) {
+            state->quiet = true;
+            command += 2;
+        } else if (strncmp(command, "V0", 2) == 0) {
+            state->verbose = false;
+            command += 2;
+        } else if (strncmp(command, "V1", 2) == 0) {
+            state->verbose = true;
+            command += 2;
+        } else if (strncmp(command, "I", 1) == 0) {
+            show_identification = true;
+            command++;
+        } else if (strncmp(command, "D", 1) == 0) {
+            if (!state->child.running && !spawn_child(&state->child, state->dial_command)) {
+                report_no_carrier(state);
+            } else {
+                enter_data_mode(state);
+            }
+            terminal_response = true;
+            break;
+        } else if (strncmp(command, "&D", 2) == 0 && command[2] != '\0') {
+            switch (command[2]) {
+            case '0':
+                state->dtr_policy = DTR_IGNORE;
+                break;
+            case '1':
+                state->dtr_policy = DTR_ESCAPE;
+                break;
+            case '2':
+                state->dtr_policy = DTR_HANGUP;
+                break;
+            case '3':
+                state->dtr_policy = DTR_HANGUP_RESET;
+                break;
+            default:
+                command_error = true;
+                break;
+            }
+            command += 3;
+        } else if (strncmp(command, "&C", 2) == 0 && (command[2] == '0' || command[2] == '1')) {
+            command += 3;
+        } else if (strncmp(command, "&S", 2) == 0 && (command[2] == '0' || command[2] == '1')) {
+            state->dsr_always = command[2] == '0';
+            if (state->control != NULL) {
+                if (state->dsr_always) {
+                    state->control->flags |= MODEM_CONTROL_DSR_ALWAYS;
+                    state->control->bits |= TIOCM_DSR;
+                } else {
+                    state->control->flags &= ~MODEM_CONTROL_DSR_ALWAYS;
+                    if (!current_dtr(state)) {
+                        state->control->bits &= ~TIOCM_DSR;
+                    }
+                }
+                state->control->generation++;
+            }
+            command += 3;
+        } else if (strncmp(command, "S0=", 3) == 0) {
+            char *end = NULL;
+            long value = strtol(command + 3, &end, 10);
+            if (end != NULL && *end == '\0' && value >= 0 && value <= 255) {
+                state->s0_auto_answer_rings = (int)value;
+            } else {
+                command_error = true;
+            }
+            break;
+        } else if (strcmp(command, "S0?") == 0) {
+            show_s0 = true;
+            break;
+        } else if (command[0] == 'O' && command[1] == '\0') {
+            if (state->child.running) {
+                enter_data_mode(state);
+            } else {
+                report_no_carrier(state);
+            }
+            terminal_response = true;
+            break;
+        } else if (command[0] == 'A' && command[1] == '\0') {
+            answer_call(state);
+            terminal_response = true;
+            break;
+        } else if (strncmp(command, "H", 1) == 0 && (command[1] == '\0' || (command[1] == '0' && command[2] == '\0'))) {
+            if (state->incoming_call && !state->child.running) {
+                reject_incoming_call(state);
+            } else {
+                hangup(state);
+            }
+            terminal_response = true;
+            break;
         } else {
-            enter_data_mode(state);
-        }
-    } else if (strncmp(state->line, "AT&D", 4) == 0 && strlen(state->line) == 5) {
-        switch (state->line[4]) {
-        case '0':
-            state->dtr_policy = DTR_IGNORE;
-            modem_write("OK\r\n");
-            break;
-        case '1':
-            state->dtr_policy = DTR_ESCAPE;
-            modem_write("OK\r\n");
-            break;
-        case '2':
-            state->dtr_policy = DTR_HANGUP;
-            modem_write("OK\r\n");
-            break;
-        case '3':
-            state->dtr_policy = DTR_HANGUP_RESET;
-            modem_write("OK\r\n");
-            break;
-        default:
-            modem_write("ERROR\r\n");
+            command_error = true;
             break;
         }
-    } else if (strncmp(state->line, "ATS0=", 5) == 0) {
-        char *end = NULL;
-        long value = strtol(state->line + 5, &end, 10);
-        if (end != NULL && *end == '\0' && value >= 0 && value <= 255) {
-            state->s0_auto_answer_rings = (int)value;
-            modem_write("OK\r\n");
-        } else {
-            modem_write("ERROR\r\n");
-        }
-    } else if (strcmp(state->line, "ATS0?") == 0) {
+    }
+
+    if (terminal_response) {
+        return;
+    }
+    if (command_error) {
+        result_error(state);
+    } else if (show_identification) {
+        modem_write("stdio modem simulator\r\n");
+        result_ok(state);
+    } else if (show_s0) {
         char response[32];
-        snprintf(response, sizeof(response), "%03d\r\nOK\r\n", state->s0_auto_answer_rings);
+        snprintf(response, sizeof(response), "%03d\r\n", state->s0_auto_answer_rings);
         modem_write(response);
-    } else if (strcmp(state->line, "ATO") == 0) {
-        if (state->child.running) {
-            enter_data_mode(state);
-        } else {
-            report_no_carrier(state);
-        }
-    } else if (strcmp(state->line, "ATA") == 0) {
-        answer_call(state);
-    } else if (strcmp(state->line, "ATH") == 0 || strcmp(state->line, "ATH0") == 0) {
-        if (state->incoming_call && !state->child.running) {
-            reject_incoming_call(state);
-        } else {
-            hangup(state);
-        }
+        result_ok(state);
     } else {
-        modem_write("ERROR\r\n");
+        result_ok(state);
     }
 }
 
@@ -474,7 +574,6 @@ static void handle_data_byte(struct modem_state *state, unsigned char byte)
     if (!state->child.running) {
         report_no_carrier(state);
         handle_command_byte(state, byte);
-        return;
     }
 
     if (byte == '+') {
@@ -537,7 +636,8 @@ static void handle_requested_incoming_call(struct modem_state *state)
 static bool is_command_option(const char *argument)
 {
     return strcmp(argument, "--incoming-call") == 0 || strcmp(argument, "--dial-command") == 0 ||
-           strcmp(argument, "--incoming-command") == 0 || strcmp(argument, "--") == 0;
+           strcmp(argument, "--incoming-command") == 0 || strcmp(argument, "--dsr-always-on") == 0 ||
+           strcmp(argument, "--") == 0;
 }
 
 static char **parse_command_argument(int argc, char **argv, int *command_index)
@@ -571,11 +671,15 @@ int main(int argc, char **argv)
     char **dial_command = default_command;
     char **incoming_command = default_command;
     bool incoming_call = false;
+    bool dsr_always_on = false;
     int command_index = 1;
 
     while (command_index < argc) {
         if (strcmp(argv[command_index], "--incoming-call") == 0) {
             incoming_call = true;
+            command_index++;
+        } else if (strcmp(argv[command_index], "--dsr-always-on") == 0) {
+            dsr_always_on = true;
             command_index++;
         } else if (strcmp(argv[command_index], "--dial-command") == 0) {
             command_index++;
@@ -604,6 +708,8 @@ int main(int argc, char **argv)
 
     struct modem_state state = {
         .echo = true,
+        .verbose = true,
+        .dsr_always = dsr_always_on,
         .mode = MODE_COMMAND,
         .dtr_policy = DTR_HANGUP,
         .dial_command = dial_command,
@@ -622,6 +728,11 @@ int main(int argc, char **argv)
     modem_set_nonblock(STDIN_FILENO);
     state.control = open_control_file_from_env();
     state.dtr = current_dtr(&state);
+    if (state.control != NULL && state.dsr_always) {
+        state.control->flags |= MODEM_CONTROL_DSR_ALWAYS;
+        state.control->bits |= TIOCM_DSR;
+        state.control->generation++;
+    }
     if (incoming_call) {
         start_incoming_call(&state);
     }

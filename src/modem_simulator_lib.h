@@ -4,12 +4,14 @@
 
 #define MODEM_CONTROL_MAGIC 0x4d535054u
 #define MODEM_CONTROL_VERSION 1u
+#define MODEM_CONTROL_DSR_ALWAYS 0x00000001u
 
 struct modem_control_shared {
     uint32_t magic;
     uint32_t version;
     volatile uint32_t bits;
     volatile uint32_t generation;
+    volatile uint32_t flags;
 };
 
 void modem_close_if_open(int *fd);
